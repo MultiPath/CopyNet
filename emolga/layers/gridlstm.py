@@ -52,7 +52,7 @@ class Grid(Recurrent):
                  ):
         super(Grid, self).__init__()
 
-        assert len(output_dims) == 2, 'in this stage, we only support 2D Grid-LSTM'
+        # assert len(output_dims) == 2, 'in this stage, we only support 2D Grid-LSTM'
         assert len(input_dims)  == len(output_dims), '# of inputs must match # of outputs.'
 
         """
@@ -238,6 +238,213 @@ class Grid(Recurrent):
                     H_new[priority] += hs_ii[priority]
 
         return H_new, M_new
+
+
+class GridLSTM3D(Grid):
+    """
+    Grid-LSTM 3D version,
+    which has one flexible dimension (time) and 2 fixed dimensions (x & y)
+    """
+    def __init__(self,
+                 # parameters for Grid.
+                 output_dims,
+                 input_dims,    # [0, ... 0], 0 represents no external inputs.
+                 priority=1,
+                 peephole=True,
+                 init='glorot_uniform', inner_init='orthogonal',
+                 forget_bias_init='one',
+                 activation='tanh', inner_activation='sigmoid',
+                 use_input=False,
+                 name=None, weights=None,
+                 identity_connect=None,
+
+                 # parameters for 2D-GridLSTM
+                 depth=10,  # the size of a big grid
+                 learn_init=False,
+                 pooling=True,
+                 attention=False,
+                 shared=True,
+                 dropout=0,
+                 rng=None,
+                 ):
+        super(Grid, self).__init__()
+
+        assert len(output_dims) == 3, 'in this stage, we only support 3D Grid-LSTM'
+        assert len(input_dims)  == len(output_dims), '# of inputs must match # of outputs.'
+        assert input_dims[2]    == 0, 'we have no z-axis inputs here.'
+        assert shared, 'we share the weights in this stage.'
+        assert not (attention and pooling), 'attention and pooling cannot be set at the same time.'
+
+        """
+        Initialization.
+        """
+        logger.info(":::: Sequential Grid-Pool LSTM ::::")
+        self.input_dims       = input_dims
+        self.output_dims      = output_dims
+        self.N                = len(output_dims)
+        self.depth            = depth
+        self.dropout          = dropout
+
+        self.priority         = priority
+        self.peephole         = peephole
+        self.use_input        = use_input
+        self.pooling          = pooling
+        self.attention        = attention
+        self.learn_init       = learn_init
+
+        self.init             = initializations.get(init)
+        self.inner_init       = initializations.get(inner_init)
+        self.forget_bias_init = initializations.get(forget_bias_init)
+        self.activation       = activations.get(activation)
+        self.relu             = activations.get('relu')
+        self.inner_activation = activations.get(inner_activation)
+
+        self.identity_connect = identity_connect
+        self.axies            = {0: 'x', 1: 'y', 2: 'z', 3: 'w'}  # only support at most 4D now!
+
+        if self.identity_connect is not None:
+            logger.info('Identity Connection: {}'.format(self.identity_connect))
+
+        """
+        Build the model weights.
+        """
+        # build the centroid grid.
+        self.build()
+
+        # input projection layer (projected to time-axis)       [x]
+        self.Ph  = Dense(input_dims[0], output_dims[0], name='Ph')
+        self.Pm  = Dense(input_dims[0], output_dims[0], name='Pm')
+
+        self._add(self.Ph)
+        self._add(self.Pm)
+
+        # learn init for depth-axis hidden states/memory cells. [y]
+        if self.learn_init:
+            self.M0  = self.init((depth, depth, output_dims[2]))
+            self.H0  = self.init((depth, depth, output_dims[2]))
+
+            self.M0.name, self.H0.name = 'M0', 'H0'
+            self.params += [self.M0, self.H0]
+
+        if weights is not None:
+            self.set_weights(weights)
+
+        if name is not None:
+            self.set_name(name)
+
+    def _step(self, *args):
+        # since depth is not determined, we cannot decide the number of inputs
+        # for one time step.
+        # if pooling is True:
+        #    args = [raw_input] +       (sequence)
+        #           [hy] + [my]*depth   (output_info)
+        #
+        inputs = args[0]  # (nb_samples, x, y)
+        Hy_tm1 = [args[k] for k in range(1, 1 + self.depth)]
+        My_tm1 = [args[k] for k in range(1 + self.depth, 1 + 2 * self.depth)]
+
+        # x_axis input projection (get hx_t, mx_t)
+        hx_t   = self.Ph(inputs)           # (nb_samples, output_dim0, output_dim1)
+        mx_t   = self.Pm(inputs)           # (nb_samples, output_dim0, output_dim1)
+
+        # build computation path from bottom to top.
+        Hx_t   = [hx_t]
+        Mx_t   = [mx_t]
+        Hy_t   = []
+        My_t   = []
+        for d in xrange(self.depth):
+            hs_i       = [Hx_t[-1], Hy_tm1[d]]
+            ms_i       = [Mx_t[-1], My_tm1[d]]
+            xs_i       = [inputs,   T.zeros_like(inputs)]
+
+            hs_o, ms_o = self.grid_(hs_i, ms_i, xs_i, priority=self.priority, identity=self.identity_connect)
+
+            Hx_t      += [hs_o[0]]
+            Hy_t      += [hs_o[1]]
+            Mx_t      += [ms_o[0]]
+            My_t      += [ms_o[1]]
+
+        hx_out = Hx_t[-1]
+        mx_out = Mx_t[-1]
+
+        # get the output (output_y, output_x)
+        # MAX-Pooling
+        if self.pooling:
+            # hy_t       = T.max([self.PP(hy) for hy in Hy_t], axis=0)
+            hy_t       = T.max([self.PP(T.concatenate([hy, inputs], axis=-1)) for hy in Hy_t], axis=0)
+            Hy_t       = [hy_t] * self.depth
+
+        if self.attention:
+            HHy_t      = T.concatenate([hy[:, None, :] for hy in Hy_t], axis=1)  # (nb_samples, n_depth, out_dim1)
+            annotation = self.A(inputs, HHy_t)   # (nb_samples, n_depth)
+            hy_t       = T.sum(HHy_t * annotation[:, :, None], axis=1)           # (nb_samples, out_dim1)
+            Hy_t       = [hy_t] * self.depth
+
+        R = Hy_t + My_t + [hx_out, mx_out]
+        return tuple(R)
+
+    def __call__(self, X, init_H=None, init_M=None,
+                 return_sequence=False, one_step=False,
+                 return_info='hy', train=True):
+        # It is training/testing path
+        self.train = train
+
+        # recently we did not support masking.
+        if X.ndim == 2:
+            X = X[:, None, :]
+
+        # one step
+        if one_step:
+            assert init_H is not None, 'previous state must be provided!'
+            assert init_M is not None, 'previous cell must be provided!'
+
+        X = X.dimshuffle((1, 0, 2))
+        if init_H is None:
+            if self.learn_init:
+                init_m     = T.repeat(self.M0[:, None, :], X.shape[1], axis=1)
+                if self.pooling:
+                    init_h = T.repeat(self.H0[None, :], self.depth, axis=0)
+                else:
+                    init_h = self.H0
+                init_h     = T.repeat(init_h[:, None, :], X.shape[1], axis=1)
+
+                init_H     = []
+                init_M     = []
+                for j in xrange(self.depth):
+                    init_H.append(init_h[j])
+                    init_M.append(init_m[j])
+            else:
+                init_H     = [T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dims[1]), 1)] * self.depth
+                init_M     = [T.unbroadcast(alloc_zeros_matrix(X.shape[1], self.output_dims[1]), 1)] * self.depth
+            pass
+
+        # computational graph !
+        if not one_step:
+            sequences    = [X]
+            outputs_info = init_H + init_M + [None, None]
+            outputs, _   = theano.scan(
+                self._step,
+                sequences=sequences,
+                outputs_info=outputs_info
+            )
+        else:
+            outputs      = self._step(*([X[0]] + init_H + init_M))
+
+        if   return_info == 'hx':
+            if return_sequence:
+                return outputs[0].dimshuffle((1, 0, 2))
+            return outputs[-2][-1]
+        elif return_info == 'hy':
+            assert self.pooling or self.attention, 'y-axis hidden states are only used in the ``Pooling Mode".'
+            if return_sequence:
+                return outputs[2].dimshuffle((1, 0, 2))
+            return outputs[2][-1]
+        elif return_info == 'hxhy':
+            assert self.pooling or self.attention, 'y-axis hidden states are only used in the ``Pooling Mode".'
+            if return_sequence:
+                return outputs[-2].dimshuffle((1, 0, 2)), outputs[2].dimshuffle((1, 0, 2))    # x-y
+            return outputs[-2][-1], outputs[2][-1]
+
 
 
 class SequentialGridLSTM(Grid):
